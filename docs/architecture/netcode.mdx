@@ -1,0 +1,109 @@
+---
+title: Reusable netcode architecture
+description: Transport-independent authoritative replication for Cardinal games
+---
+
+World Engine's `pkg/netcode` package provides the state-management core for a
+game networking server. It is deliberately separate from Cardinal's ECS and from
+any particular wire transport, so games can choose their own component schemas,
+ConnectRPC/WebSocket/QUIC transport, and client interpolation strategy.
+
+## Why this shape
+
+The design adopts the useful boundaries in coherence's replication architecture:
+
+- A replication server distributes schema-defined entity state while a simulator
+  owns gameplay execution.
+- State authority and input authority are independent. A Cardinal shard can own
+  an entity's state while the player who created it keeps control of its inputs.
+- Server-controlled areas of interest prevent clients from receiving entities
+  outside their visibility query.
+- A game-defined projection stage implements network level of detail by omitting
+  or quantizing components as distance increases.
+- Changed state is sent relative to an acknowledged baseline, while input is
+  queued against simulation ticks.
+
+These boundaries correspond to coherence's documentation for
+[server-authoritative input](https://docs.coherence.io/manual/authority/server-authoritative-setup),
+[area of interest](https://docs.coherence.io/manual/optimization), and
+[network LOD](https://docs.coherence.io/1.4/manual/optimization/level-of-detail-lod).
+World Engine keeps them as ordinary Go interfaces and values rather than a
+Unity-specific baking or transport pipeline.
+
+## Runtime flow
+
+For every connected peer:
+
+1. Register a server-owned `netcode.Query` with `Replicator.AddPeer`.
+2. Accept client commands through `InputQueue.Submit`. The queue rejects commands
+   from peers without input authority, expired ticks, excessive lookahead, and
+   duplicate or decreasing sequence numbers.
+3. At the start of a Cardinal tick, call `InputQueue.Drain` and apply the returned
+   commands in deterministic entity, peer, and sequence order.
+4. After systems run, map the game ECS state to `[]netcode.Entity` and call
+   `Replicator.BuildFrame` for each peer.
+5. Encode and send the returned `netcode.Frame` using the game's chosen transport.
+6. Pass delivery acknowledgements to `Replicator.Ack`. Until an acknowledgement
+   arrives, new frames remain based on the last delivered state, so loss does not
+   permanently skip creates or updates.
+
+`Frame.Creates`, `Frame.Updates`, and `Frame.Deletes` are stable-sorted, making
+the output deterministic for recording and tests. Component payloads are opaque
+bytes identified by a game-owned `ComponentID`; the package never uses reflection
+or imposes a serialization format.
+
+## Authority
+
+`AuthorityRegistry` records two owners per entity:
+
+```go
+authority := netcode.NewAuthorityRegistry()
+authority.Register(playerEntity, netcode.Authority{
+    State: "cardinal-shard",
+    Input: "player-session-42",
+})
+inputs := netcode.NewInputQueue(authority, 3, 4096)
+```
+
+Only the current state owner can transfer state or input authority. Transport
+authentication should produce the `PeerID`; never accept it from an untrusted
+message body.
+
+## Interest and network LOD
+
+The default `SphereInterest` combines a radius with a 64-bit layer mask. Games
+with grids, portals, teams, fog of war, or shard-specific visibility can implement
+`InterestFilter`. The query must be positioned from authoritative state rather
+than a client-supplied camera location.
+
+Implement `Projector` to create per-peer network LOD. A projector receives a copy
+of the entity and its distance from the query center, so it can safely remove a
+cosmetic component or replace a high-precision payload with a quantized encoding.
+Coherence similarly combines distance-based component selection and field
+precision, and notes that LOD complements rather than replaces source-side sample
+rate control. See its [simulation frequency guidance](https://docs.coherence.io/manual/optimization/simulation-frequency).
+
+## Reliability and transport contract
+
+Each frame names both `Sequence` and `BaseSequence`. A client must apply a frame
+only when its local baseline matches `BaseSequence`, then acknowledge `Sequence`.
+The server retains a bounded number of projected snapshots; acknowledgements for
+evicted snapshots return `ErrUnknownFrame` and the transport should reset that
+peer's session to force a fresh create baseline.
+
+The core does not implement packet fragmentation, congestion control, encryption,
+client interpolation, or rollback. Those belong above or beside replication:
+
+- Use a reliable ordered stream first. An unreliable transport needs explicit
+  fragmentation, retransmission, and baseline-reset messages.
+- Interpolate visual transforms on the client; do not feed interpolated state
+  into the authoritative Cardinal simulation.
+- The rolling input queue provides the primitive needed for prediction and
+  rollback, but snapshotting/restoring game-specific simulation state remains a
+  game responsibility. Coherence also describes prediction and rollback as a
+  layer built on buffered inputs in its
+  [competitive games documentation](https://docs.coherence.io/manual/advanced-topics/competitive-games/determinism-prediction-rollback).
+
+This separation keeps the World Engine layer reusable across action games, MMOs,
+strategy games, and turn-based worlds without embedding one game's movement,
+physics, or transport policy in Cardinal.
